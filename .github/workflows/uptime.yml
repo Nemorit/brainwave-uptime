@@ -1,0 +1,108 @@
+name: uptime
+
+# The second layer. The minute-by-minute checker in deploy/uptime-check.sh runs
+# on the server it monitors, which cannot report its own death — that is what
+# this is for. It runs on GitHub's machines, so a dead box, a dead datacentre
+# or an expired domain all surface here.
+#
+# GitHub's scheduler is best-effort and often runs late under load, so treat
+# this as a ~15 minute safety net, not as the primary monitor.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check both sites
+        id: check
+        run: |
+          set -uo pipefail
+          fail=""
+
+          check() {   # check <name> <url> <expected text>
+            local name=$1 url=$2 expect=$3 body code
+            # Three attempts: a single timeout from a GitHub runner is noise,
+            # and a monitor that cries wolf gets muted, which is worse than no
+            # monitor at all.
+            for attempt in 1 2 3; do
+              body=$(curl -sS -m 25 -w '\n%{http_code}' -A 'bwg-uptime-gh/1.0' "$url" 2>/dev/null)
+              code=$(printf '%s' "$body" | tail -1)
+              if [ "$code" = "200" ] && [[ "$body" == *"$expect"* ]]; then
+                echo "ok      $name ($url)"
+                return 0
+              fi
+              sleep 15
+            done
+            if [ "$code" = "401" ]; then
+              echo "FAIL    $name — HTTP 401, staging lock is on"
+              fail="$fail $name(401)"
+            else
+              echo "FAIL    $name — HTTP ${code:-no response}"
+              fail="$fail $name(${code:-none})"
+            fi
+          }
+
+          check us-home     https://brainwavegenerator.us/             "Brainwave Generator"
+          check us-sitemap  https://brainwavegenerator.us/sitemap.xml  "<loc>"
+          check us-page     https://brainwavegenerator.us/noise/brown/ "Brown noise generator"
+          check com-home    https://brainwavegenenator.com/            "<html"
+
+          # Certificate expiry: the failure that arrives on a schedule and takes
+          # a site down completely when it lands.
+          for host in brainwavegenerator.us brainwavegenenator.com; do
+            end=$(echo | openssl s_client -servername "$host" -connect "$host":443 2>/dev/null \
+                  | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+            if [ -z "$end" ]; then
+              echo "FAIL    cert-$host — could not read certificate"
+              fail="$fail cert-$host"
+              continue
+            fi
+            days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+            if [ "$days" -lt 10 ]; then
+              echo "FAIL    cert-$host — expires in $days days"
+              fail="$fail cert-$host($days d)"
+            else
+              echo "ok      cert-$host — $days days left"
+            fi
+          done
+
+          echo "failed=$fail" >> "$GITHUB_OUTPUT"
+          [ -z "$fail" ] || exit 1
+
+      - name: Push alert
+        if: failure()
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          [ -n "${TOPIC:-}" ] || exit 0
+          curl -fsS -m 10 \
+            -H "Title: DOWN (external check)" \
+            -H "Priority: urgent" -H "Tags: rotating_light" \
+            -d "GitHub Actions could not reach: ${{ steps.check.outputs.failed }}
+Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            "https://ntfy.sh/$TOPIC" || true
+
+      - name: Heartbeat
+        if: success()
+        run: |
+          # A scheduled workflow is disabled after 60 days without repository
+          # activity. One commit a day is cheap insurance against the monitor
+          # quietly switching itself off — which is the same class of failure it
+          # was built to catch.
+          date -u +'%Y-%m-%dT%H:%M:%SZ last successful check' > last-check.txt
+          if ! git diff --quiet -- last-check.txt && [ "$(date -u +%H%M)" -lt 0015 ]; then
+            git config user.name 'uptime bot'
+            git config user.email 'actions@github.com'
+            git commit -qm "heartbeat $(date -u +%F)" -- last-check.txt
+            git push
+          fi
