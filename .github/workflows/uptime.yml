@@ -83,14 +83,18 @@ jobs:
         if: failure()
         env:
           TOPIC: ${{ secrets.NTFY_TOPIC }}
+          FAILED: ${{ steps.check.outputs.failed }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           [ -n "${TOPIC:-}" ] || exit 0
+          # Built in a variable rather than inline: a multi-line string whose
+          # second line starts at column 0 ends the YAML block scalar, which is
+          # how the first version of this file failed to parse at all.
+          MSG="GitHub Actions could not reach: ${FAILED}. Run: ${RUN_URL}"
           curl -fsS -m 10 \
             -H "Title: DOWN (external check)" \
             -H "Priority: urgent" -H "Tags: rotating_light" \
-            -d "GitHub Actions could not reach: ${{ steps.check.outputs.failed }}
-Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            "https://ntfy.sh/$TOPIC" || true
+            -d "$MSG" "https://ntfy.sh/$TOPIC" || true
 
       - name: Heartbeat
         if: success()
